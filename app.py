@@ -1,5 +1,6 @@
-from flask import Flask, request, render_template_string, send_file, session, redirect, url_for
-import requests, zipfile, io, re, time
+from flask import Flask, request, render_template_string, send_file, session, redirect, url_for, jsonify
+import requests, zipfile, io, re, time, uuid, threading, os
+from urllib.parse import unquote
 
 app = Flask(__name__)
 # Khóa bảo mật để tạo Session lưu trạng thái đăng nhập (bắt buộc phải có)
@@ -8,8 +9,17 @@ app.secret_key = 'Soca_Studio_AutoHDR_Super_Secret_Key_2026'
 # ĐỊA CHỈ MÁY CHỦ QUẢN LÝ KEY CỦA ĐẠI CA
 ADMIN_SERVER_URL = "https://caoson.pythonanywhere.com"
 
+# Thư mục lưu tạm file ZIP trên Server Render
+TEMP_DIR = "temp_zips"
+if not os.path.exists(TEMP_DIR):
+    os.makedirs(TEMP_DIR)
+
+# Biến toàn cục lưu tiến trình tải của khách
+# Cấu trúc: {'task_id': {'progress': 50, 'status': 'Đang tải...', 'done': False, 'file': '', 'error': ''}}
+TASKS = {}
+
 # =========================================================================
-# GIAO DIỆN 1: MÀN HÌNH ĐĂNG NHẬP (LOGIN)
+# GIAO DIỆN 1: MÀN HÌNH ĐĂNG NHẬP (LOGIN) - GIỮ NGUYÊN
 # =========================================================================
 LOGIN_HTML = """
 <!DOCTYPE html>
@@ -49,7 +59,7 @@ LOGIN_HTML = """
 """
 
 # =========================================================================
-# GIAO DIỆN 2: MÀN HÌNH TẢI ẢNH (DASHBOARD)
+# GIAO DIỆN 2: MÀN HÌNH TẢI ẢNH (ĐÃ ĐỘ THÊM THANH TIẾN TRÌNH PROGRESS BAR)
 # =========================================================================
 DASHBOARD_HTML = """
 <!DOCTYPE html>
@@ -73,8 +83,13 @@ DASHBOARD_HTML = """
         input[type="text"]:focus { outline: none; border-color: #8b5cf6; }
         button { width: 100%; padding: 18px; font-size: 18px; font-weight: bold; background-color: #8b5cf6; color: white; border: none; border-radius: 12px; cursor: pointer; transition: 0.3s; text-transform: uppercase; }
         button:hover { background-color: #7c3aed; }
-        .error-msg { color: #ef4444; background-color: rgba(239, 68, 68, 0.1); padding: 15px; border-radius: 8px; border: 1px solid #ef4444; margin-bottom: 20px; font-weight: bold; {% if not error %}display: none;{% endif %} }
-        .status-box { margin-top: 20px; padding: 15px; border-radius: 8px; background-color: #000; border: 1px solid #334155; color: #f59e0b; font-family: 'Consolas', monospace; font-size: 13px; display: none; }
+        .error-msg { color: #ef4444; background-color: rgba(239, 68, 68, 0.1); padding: 15px; border-radius: 8px; border: 1px solid #ef4444; margin-bottom: 20px; font-weight: bold; display: none; }
+        
+        /* CODE CSS CHO THANH TIẾN TRÌNH */
+        .progress-container { margin-top: 25px; display: none; }
+        .progress-bg { width: 100%; background-color: #334155; border-radius: 10px; overflow: hidden; height: 22px; position: relative; }
+        .progress-bar { width: 0%; height: 100%; background-color: #10b981; transition: width 0.3s ease; }
+        .progress-text { margin-top: 10px; font-family: 'Consolas', monospace; font-size: 14px; color: #fbbf24; font-weight: bold; }
     </style>
 </head>
 <body>
@@ -85,150 +100,252 @@ DASHBOARD_HTML = """
         </div>
         <h1>AUTOHDR DASHBOARD</h1>
         <div class="subtitle">Dán link dự án để tiến hành tải ảnh ngay</div>
-        <div class="error-msg">{{ error }}</div>
+        
+        <div class="error-msg" id="errorBox"></div>
 
-        <form action="/download" method="POST" id="dlForm" onsubmit="showLoading()">
+        <div id="dlForm">
             <label>🔗 MÃ UUID HOẶC ĐƯỜNG DẪN DỰ ÁN:</label>
-            <input type="text" name="uuid" placeholder="Ví dụ: https://www.autohdr.com/... hoặc mã d8b2..." required>
-            <button type="submit" id="downloadBtn">⚡ BẮT ĐẦU TẢI DỰ ÁN</button>
-        </form>
+            <input type="text" id="uuidInput" placeholder="Ví dụ: https://www.autohdr.com/... hoặc mã d8b2..." required>
+            <button onclick="startDownload()" id="downloadBtn">⚡ BẮT ĐẦU TẢI DỰ ÁN</button>
+        </div>
 
-        <div class="status-box" id="logBox">
-            🚀 Đang kết nối máy chủ AutoHDR...<br>
-            ⏳ Xin vui lòng chờ, tải xong sẽ tự động ra file ZIP!
+        <div class="progress-container" id="progressContainer">
+            <div class="progress-bg">
+                <div class="progress-bar" id="progressBar"></div>
+            </div>
+            <div class="progress-text" id="progressText">🚀 Đang kết nối máy chủ...</div>
         </div>
     </div>
-    <script> function showLoading() { document.getElementById('downloadBtn').innerHTML = '⏳ ĐANG XỬ LÝ... ĐỪNG TẮT TRANG NÀY!'; document.getElementById('downloadBtn').style.backgroundColor = '#475569'; document.getElementById('downloadBtn').style.pointerEvents = 'none'; document.getElementById('logBox').style.display = 'block'; document.querySelector('.error-msg').style.display = 'none'; } </script>
+
+    <script>
+        let pollInterval;
+
+        function startDownload() {
+            const uuidVal = document.getElementById('uuidInput').value.trim();
+            if(!uuidVal) {
+                showError("❌ Vui lòng nhập link dự án hoặc UUID!");
+                return;
+            }
+
+            // Giao diện đổi sang Đang tải
+            document.getElementById('errorBox').style.display = 'none';
+            document.getElementById('downloadBtn').innerHTML = '⏳ ĐANG KHỞI ĐỘNG...';
+            document.getElementById('downloadBtn').style.backgroundColor = '#475569';
+            document.getElementById('downloadBtn').style.pointerEvents = 'none';
+            document.getElementById('progressContainer').style.display = 'block';
+            document.getElementById('progressBar').style.width = '2%';
+            document.getElementById('progressText').innerText = '🚀 Đang phân tích đường dẫn...';
+
+            // Dùng AJAX gọi API bắt đầu tải ngầm
+            fetch('/api/start_download', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                body: 'uuid=' + encodeURIComponent(uuidVal)
+            })
+            .then(res => res.json())
+            .then(data => {
+                if(data.error) {
+                    resetUI();
+                    showError(data.error);
+                } else if(data.task_id) {
+                    // Nếu bắt đầu thành công, gọi hàm chạy %
+                    pollProgress(data.task_id);
+                }
+            })
+            .catch(err => {
+                resetUI();
+                showError("❌ Lỗi mất kết nối mạng cục bộ!");
+            });
+        }
+
+        function pollProgress(taskId) {
+            // Cứ 1 giây lại hỏi thăm Server xem tải được bao nhiêu % rồi
+            pollInterval = setInterval(() => {
+                fetch('/api/progress/' + taskId)
+                .then(res => res.json())
+                .then(data => {
+                    if(data.error) {
+                        clearInterval(pollInterval);
+                        resetUI();
+                        showError(data.error);
+                    } else {
+                        // Cập nhật thanh xanh lá cây
+                        document.getElementById('progressBar').style.width = data.progress + '%';
+                        document.getElementById('progressText').innerText = data.status + ' (' + data.progress + '%)';
+                        
+                        // Nếu báo 100% (done = true) thì cho nhảy link tải ZIP
+                        if(data.done) {
+                            clearInterval(pollInterval);
+                            document.getElementById('progressText').innerText = '✅ HOÀN TẤT! ĐANG LƯU FILE...';
+                            document.getElementById('progressBar').style.backgroundColor = '#3b82f6';
+                            setTimeout(() => {
+                                window.location.href = '/api/download_zip/' + taskId;
+                                setTimeout(resetUI, 2000); // 2 giây sau reset lại UI cho tải cái khác
+                            }, 500);
+                        }
+                    }
+                })
+                .catch(err => console.log(err));
+            }, 1000);
+        }
+
+        function showError(msg) {
+            const errBox = document.getElementById('errorBox');
+            errBox.innerText = msg;
+            errBox.style.display = 'block';
+        }
+
+        function resetUI() {
+            document.getElementById('downloadBtn').innerHTML = '⚡ BẮT ĐẦU TẢI DỰ ÁN';
+            document.getElementById('downloadBtn').style.backgroundColor = '#8b5cf6';
+            document.getElementById('downloadBtn').style.pointerEvents = 'auto';
+            document.getElementById('progressContainer').style.display = 'none';
+            document.getElementById('progressBar').style.width = '0%';
+            document.getElementById('progressBar').style.backgroundColor = '#10b981';
+        }
+    </script>
 </body>
 </html>
 """
 
-# =========================================================================
-# HÀM LẤY IP CỦA KHÁCH HÀNG (Chuẩn cho PythonAnywhere)
-# =========================================================================
 def get_client_ip():
     if request.headers.getlist("X-Forwarded-For"):
-        # PA dùng proxy nên phải móc trong header ra
-        ip = request.headers.getlist("X-Forwarded-For")[0].split(',')[0].strip()
-    else:
-        ip = request.remote_addr
-    return ip
+        return request.headers.getlist("X-Forwarded-For")[0].split(',')[0].strip()
+    return request.remote_addr
 
-# =========================================================================
-# XỬ LÝ CÁC TRANG WEB
-# =========================================================================
-
-# Trang chủ: Nếu chưa có Session thì quăng ra Login, có rồi thì vào Dashboard
 @app.route('/')
 def index():
-    if 'user_key' in session:
-        return redirect(url_for('dashboard'))
+    if 'user_key' in session: return redirect(url_for('dashboard'))
     return render_template_string(LOGIN_HTML, error="", last_key="", client_ip=get_client_ip())
 
-# Nơi hứng thông tin Đăng Nhập
 @app.route('/login', methods=['POST'])
 def login():
     user_key = request.form.get('user_key', '').strip()
     client_ip = get_client_ip()
-
-    if not user_key:
-        return render_template_string(LOGIN_HTML, error="❌ Vui lòng nhập Key Bản Quyền!", last_key="", client_ip=client_ip)
+    if not user_key: return render_template_string(LOGIN_HTML, error="❌ Vui lòng nhập Key Bản Quyền!", last_key="", client_ip=client_ip)
 
     try:
-        # ĐẠI CA CHÚ Ý: ĐÃ NHÉT CẢ 'ip' VÀO TRONG GÓI TIN GỬI SANG ADMIN
         verify_res = requests.post(f"{ADMIN_SERVER_URL}/api/verify", json={"key": user_key, "ip": client_ip}, timeout=10)
         v_data = verify_res.json()
-        
         if verify_res.status_code != 200 or not (v_data.get("valid") or v_data.get("status") == "ok"):
             return render_template_string(LOGIN_HTML, error=f"❌ {v_data.get('message', 'Key sai, hết hạn hoặc sai IP!')}", last_key=user_key, client_ip=client_ip)
-            
-        # Nếu OK, lưu vào Session của trình duyệt khách
+        
         session['user_key'] = user_key
         return redirect(url_for('dashboard'))
-        
     except Exception as e:
         return render_template_string(LOGIN_HTML, error=f"⚠️ Lỗi kết nối Máy chủ Key: {str(e)}", last_key=user_key, client_ip=client_ip)
 
-# Trang Dashboard tải ảnh
 @app.route('/dashboard')
 def dashboard():
-    if 'user_key' not in session:
-        return redirect(url_for('index'))
-    return render_template_string(DASHBOARD_HTML, error="")
+    if 'user_key' not in session: return redirect(url_for('index'))
+    return render_template_string(DASHBOARD_HTML)
 
-# Nút Đăng xuất
 @app.route('/logout')
 def logout():
     session.pop('user_key', None)
     return redirect(url_for('index'))
 
-# Xử lý nút Tải Ảnh
-@app.route('/download', methods=['POST'])
-def download_job():
-    if 'user_key' not in session:
-        return redirect(url_for('index'))
-
-    user_key = session['user_key']
-    client_ip = get_client_ip()
-    raw_uuid = request.form.get('uuid', '').strip()
-    
-    if not raw_uuid:
-        return render_template_string(DASHBOARD_HTML, error="❌ Vui lòng nhập Mã dự án!")
-
-    # CHECK KEY LẠI 1 LẦN NỮA TRƯỚC KHI CHO TẢI ĐỂ ĐỀ PHÒNG KEY VỪA HẾT HẠN
+# =========================================================================
+# LÕI ĐỘNG CƠ: TẢI NGẦM TRONG BACKGROUND (THREADING)
+# =========================================================================
+def background_download_task(task_id, target_uuid, user_key):
     try:
-        verify_res = requests.post(f"{ADMIN_SERVER_URL}/api/verify", json={"key": user_key, "ip": client_ip}, timeout=10)
-        v_data = verify_res.json()
-        if verify_res.status_code != 200 or not (v_data.get("valid") or v_data.get("status") == "ok"):
-            session.pop('user_key', None) # Sút mẹ ra
-            return render_template_string(LOGIN_HTML, error=f"❌ Key vừa hết hạn hoặc bị khóa: {v_data.get('message')}", last_key="", client_ip=client_ip)
-    except: pass # Nếu check lỗi mạng thì tạm cho qua
-
-    # ================= BẮT ĐẦU TẢI ẢNH =================
-    match = re.search(r'([a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12})', raw_uuid)
-    if not match:
-        return render_template_string(DASHBOARD_HTML, error="❌ LỖI: Mã UUID không hợp lệ!")
-    target_uuid = match.group(1)
-
-    check_url = f"https://www.autohdr.com/api/proxy/photoshoots/uuid/{target_uuid}/processed_photos?page=1&page_size=100&_t={int(time.time())}"
-    headers = { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" }
-    
-    try:
+        TASKS[task_id]['progress'] = 5
+        TASKS[task_id]['status'] = 'Đang quét máy chủ AutoHDR...'
+        
+        check_url = f"https://www.autohdr.com/api/proxy/photoshoots/uuid/{target_uuid}/processed_photos?page=1&page_size=100&_t={int(time.time())}"
+        headers = { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" }
+        
         res = requests.get(check_url, headers=headers, timeout=15)
         if res.status_code != 200:
-            return render_template_string(DASHBOARD_HTML, error=f"❌ AUTOHDR TỪ CHỐI! Lỗi {res.status_code}. (Cần login hoặc sai mã)")
+            TASKS[task_id]['error'] = f"❌ AUTOHDR TỪ CHỐI! Lỗi {res.status_code}."
+            return
             
         data = res.json()
         photos = data if isinstance(data, list) else data.get('processed_photos', [])
         
         if not photos:
-            return render_template_string(DASHBOARD_HTML, error="⏳ DỰ ÁN CHƯA XONG! Vui lòng đợi 5 phút rồi tải lại.")
+            TASKS[task_id]['error'] = "⏳ DỰ ÁN ĐANG XỬ LÝ! Ảnh chưa trộn xong, vui lòng đợi 5 phút rồi tải lại."
+            return
 
+        total_photos = len(photos)
+        TASKS[task_id]['progress'] = 10
+        TASKS[task_id]['status'] = f'Tìm thấy {total_photos} ảnh. Bắt đầu tải...'
+
+        zip_filename = f'Job_{target_uuid[:8]}.zip'
+        zip_path = os.path.join(TEMP_DIR, zip_filename)
         success_count = 0
-        memory_file = io.BytesIO()
-        with zipfile.ZipFile(memory_file, 'w', zipfile.ZIP_DEFLATED) as zf:
+        
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
             for i, photo in enumerate(photos):
                 img_url = photo.get('url')
                 if not img_url: continue
                 
-                from urllib.parse import unquote
                 original_name = photo.get('name') or photo.get('original_name') or f"AutoHDR_Photo_{i+1}.jpg"
                 original_name = unquote(original_name)
+                
+                # Báo ra ngoài Web là đang tải ảnh nào
+                TASKS[task_id]['status'] = f'Đang kéo ảnh {i+1}/{total_photos}...'
                 
                 img_res = requests.get(img_url, timeout=30)
                 if img_res.status_code == 200:
                     zf.writestr(original_name, img_res.content)
                     success_count += 1
-                    
-        memory_file.seek(0)
-        
-        # Báo trừ lượt
+                
+                # Tính % tiến trình (Từ 10% đến 95%)
+                current_percent = 10 + int(85 * ((i + 1) / total_photos))
+                TASKS[task_id]['progress'] = current_percent
+
+        TASKS[task_id]['status'] = 'Đang đóng gói file ZIP...'
+        TASKS[task_id]['progress'] = 98
+
+        # Trừ lượt tải nếu cần
         if success_count > 0:
             try: requests.post(f"{ADMIN_SERVER_URL}/api/consume", json={"key": user_key, "img_count": success_count, "count": success_count}, timeout=5)
             except: pass 
         
-        safe_filename = f'Job_{target_uuid[:8]}.zip'
-        return send_file(memory_file, mimetype='application/zip', as_attachment=True, download_name=safe_filename)
+        TASKS[task_id]['progress'] = 100
+        TASKS[task_id]['status'] = 'Đã xong!'
+        TASKS[task_id]['done'] = True
+        TASKS[task_id]['file_path'] = zip_path
+        TASKS[task_id]['filename'] = zip_filename
 
     except Exception as e:
-        return render_template_string(DASHBOARD_HTML, error=f"❌ LỖI MÁY CHỦ WEB: {str(e)}")
+        TASKS[task_id]['error'] = f"❌ LỖI TRONG QUÁ TRÌNH TẢI: {str(e)}"
+
+# =========================================================================
+# CÁC API GIAO TIẾP VỚI AJAX CỦA TRÌNH DUYỆT
+# =========================================================================
+@app.route('/api/start_download', methods=['POST'])
+def api_start():
+    if 'user_key' not in session: return jsonify({'error': '❌ Hết phiên đăng nhập!'})
+    
+    raw_uuid = request.form.get('uuid', '').strip()
+    match = re.search(r'([a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12})', raw_uuid)
+    if not match: return jsonify({'error': '❌ Mã UUID không hợp lệ!'})
+    target_uuid = match.group(1)
+
+    # Sinh ra 1 cái mã riêng cho phiên tải này
+    task_id = str(uuid.uuid4())
+    TASKS[task_id] = {'progress': 0, 'status': 'Khởi tạo...', 'done': False, 'error': None}
+
+    # Bắn nó vào 1 luồng ngầm (Background Thread) để Server trả lời Browser ngay lập tức
+    thread = threading.Thread(target=background_download_task, args=(task_id, target_uuid, session['user_key']))
+    thread.daemon = True
+    thread.start()
+
+    return jsonify({'task_id': task_id})
+
+@app.route('/api/progress/<task_id>', methods=['GET'])
+def api_progress(task_id):
+    if task_id in TASKS:
+        return jsonify(TASKS[task_id])
+    return jsonify({'error': '❌ Không tìm thấy tiến trình này!'})
+
+@app.route('/api/download_zip/<task_id>', methods=['GET'])
+def api_download_zip(task_id):
+    if task_id in TASKS and TASKS[task_id].get('done'):
+        file_path = TASKS[task_id]['file_path']
+        filename = TASKS[task_id]['filename']
+        return send_file(file_path, mimetype='application/zip', as_attachment=True, download_name=filename)
+    return "File chưa sẵn sàng hoặc đã bị lỗi!", 404
