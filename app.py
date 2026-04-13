@@ -3,23 +3,21 @@ import requests, zipfile, io, re, time, uuid, threading, os
 from urllib.parse import unquote
 
 app = Flask(__name__)
-# Khóa bảo mật để tạo Session lưu trạng thái đăng nhập (bắt buộc phải có)
+# Khóa bảo mật để tạo Session
 app.secret_key = 'Soca_Studio_AutoHDR_Super_Secret_Key_2026'
 
 # ĐỊA CHỈ MÁY CHỦ QUẢN LÝ KEY CỦA ĐẠI CA
 ADMIN_SERVER_URL = "https://caoson.pythonanywhere.com"
 
-# Thư mục lưu tạm file ZIP trên Server Render
+# Thư mục lưu tạm file ZIP trên Server
 TEMP_DIR = "temp_zips"
 if not os.path.exists(TEMP_DIR):
     os.makedirs(TEMP_DIR)
 
-# Biến toàn cục lưu tiến trình tải của khách
-# Cấu trúc: {'task_id': {'progress': 50, 'status': 'Đang tải...', 'done': False, 'file': '', 'error': ''}}
 TASKS = {}
 
 # =========================================================================
-# GIAO DIỆN 1: MÀN HÌNH ĐĂNG NHẬP (LOGIN) - GIỮ NGUYÊN
+# GIAO DIỆN 1: MÀN HÌNH ĐĂNG NHẬP (LOGIN)
 # =========================================================================
 LOGIN_HTML = """
 <!DOCTYPE html>
@@ -59,7 +57,7 @@ LOGIN_HTML = """
 """
 
 # =========================================================================
-# GIAO DIỆN 2: MÀN HÌNH TẢI ẢNH (ĐÃ ĐỘ THÊM THANH TIẾN TRÌNH PROGRESS BAR)
+# GIAO DIỆN 2: MÀN HÌNH TẢI ẢNH (ĐÃ THÊM NÚT UPLOAD VÀ HIỆN TÊN USER)
 # =========================================================================
 DASHBOARD_HTML = """
 <!DOCTYPE html>
@@ -72,20 +70,30 @@ DASHBOARD_HTML = """
         @import url('https://fonts.googleapis.com/css2?family=Roboto:wght@400;700;900&display=swap');
         body { font-family: 'Roboto', sans-serif; background-color: #0f172a; color: white; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; background-image: radial-gradient(circle at 50% 0%, #1e293b 0%, #0f172a 70%); }
         .container { background-color: #1e293b; padding: 40px; border-radius: 20px; box-shadow: 0 10px 30px rgba(0,0,0,0.5); border: 1px solid #334155; width: 100%; max-width: 500px; text-align: center; }
+        
         .header-bar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 25px; padding-bottom: 15px; border-bottom: 1px solid #334155; }
-        .header-bar span { color: #10b981; font-weight: bold; font-size: 14px; }
+        .header-bar span { color: #e2e8f0; font-size: 14px; }
+        .username-hl { color: #fbbf24; font-weight: bold; text-transform: uppercase; letter-spacing: 1px;}
+        
         .logout-btn { background-color: #ef4444; color: white; text-decoration: none; padding: 8px 15px; border-radius: 8px; font-size: 13px; font-weight: bold; transition: 0.3s; }
         .logout-btn:hover { background-color: #be123c; }
+        
         h1 { color: #38bdf8; font-size: 28px; font-weight: 900; margin: 0 0 5px 0; }
         .subtitle { color: #94a3b8; font-size: 14px; margin-bottom: 25px; }
+        
+        /* Nút Upload Sang Trang Chủ */
+        .upload-btn { display: block; width: 100%; padding: 15px; font-size: 15px; font-weight: bold; color: #10b981; border: 2px dashed #10b981; border-radius: 12px; text-decoration: none; margin-bottom: 25px; transition: 0.3s; box-sizing: border-box;}
+        .upload-btn:hover { background-color: rgba(16, 185, 129, 0.1); color: #34d399; border-color: #34d399;}
+
         label { display: block; text-align: left; font-weight: bold; font-size: 14px; color: #e2e8f0; margin-bottom: 10px; }
         input[type="text"] { width: 100%; padding: 16px; font-size: 15px; background-color: #0f172a; border: 2px solid #475569; border-radius: 12px; color: white; box-sizing: border-box; margin-bottom: 20px; }
         input[type="text"]:focus { outline: none; border-color: #8b5cf6; }
-        button { width: 100%; padding: 18px; font-size: 18px; font-weight: bold; background-color: #8b5cf6; color: white; border: none; border-radius: 12px; cursor: pointer; transition: 0.3s; text-transform: uppercase; }
-        button:hover { background-color: #7c3aed; }
+        
+        button.action-btn { width: 100%; padding: 18px; font-size: 18px; font-weight: bold; background-color: #8b5cf6; color: white; border: none; border-radius: 12px; cursor: pointer; transition: 0.3s; text-transform: uppercase; }
+        button.action-btn:hover { background-color: #7c3aed; }
+        
         .error-msg { color: #ef4444; background-color: rgba(239, 68, 68, 0.1); padding: 15px; border-radius: 8px; border: 1px solid #ef4444; margin-bottom: 20px; font-weight: bold; display: none; }
         
-        /* CODE CSS CHO THANH TIẾN TRÌNH */
         .progress-container { margin-top: 25px; display: none; }
         .progress-bg { width: 100%; background-color: #334155; border-radius: 10px; overflow: hidden; height: 22px; position: relative; }
         .progress-bar { width: 0%; height: 100%; background-color: #10b981; transition: width 0.3s ease; }
@@ -95,18 +103,21 @@ DASHBOARD_HTML = """
 <body>
     <div class="container">
         <div class="header-bar">
-            <span>✅ Trạng thái VIP</span>
+            <span>👤 Chào đại ca: <span class="username-hl">{{ user_name }}</span></span>
             <a href="/logout" class="logout-btn">ĐĂNG XUẤT</a>
         </div>
+        
         <h1>AUTOHDR DASHBOARD</h1>
         <div class="subtitle">Dán link dự án để tiến hành tải ảnh ngay</div>
         
+        <a href="https://www.autohdr.com" target="_blank" class="upload-btn">☁️ MỞ WEB AUTOHDR ĐỂ UP ẢNH TRƯỚC</a>
+
         <div class="error-msg" id="errorBox"></div>
 
         <div id="dlForm">
-            <label>🔗 MÃ UUID HOẶC ĐƯỜNG DẪN DỰ ÁN:</label>
+            <label>🔗 SAU ĐÓ DÁN LINK DỰ ÁN VÀO ĐÂY ĐỂ TẢI:</label>
             <input type="text" id="uuidInput" placeholder="Ví dụ: https://www.autohdr.com/... hoặc mã d8b2..." required>
-            <button onclick="startDownload()" id="downloadBtn">⚡ BẮT ĐẦU TẢI DỰ ÁN</button>
+            <button class="action-btn" onclick="startDownload()" id="downloadBtn">⚡ BẮT ĐẦU TẢI VỀ MÁY</button>
         </div>
 
         <div class="progress-container" id="progressContainer">
@@ -127,7 +138,6 @@ DASHBOARD_HTML = """
                 return;
             }
 
-            // Giao diện đổi sang Đang tải
             document.getElementById('errorBox').style.display = 'none';
             document.getElementById('downloadBtn').innerHTML = '⏳ ĐANG KHỞI ĐỘNG...';
             document.getElementById('downloadBtn').style.backgroundColor = '#475569';
@@ -136,7 +146,6 @@ DASHBOARD_HTML = """
             document.getElementById('progressBar').style.width = '2%';
             document.getElementById('progressText').innerText = '🚀 Đang phân tích đường dẫn...';
 
-            // Dùng AJAX gọi API bắt đầu tải ngầm
             fetch('/api/start_download', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -148,7 +157,6 @@ DASHBOARD_HTML = """
                     resetUI();
                     showError(data.error);
                 } else if(data.task_id) {
-                    // Nếu bắt đầu thành công, gọi hàm chạy %
                     pollProgress(data.task_id);
                 }
             })
@@ -159,7 +167,6 @@ DASHBOARD_HTML = """
         }
 
         function pollProgress(taskId) {
-            // Cứ 1 giây lại hỏi thăm Server xem tải được bao nhiêu % rồi
             pollInterval = setInterval(() => {
                 fetch('/api/progress/' + taskId)
                 .then(res => res.json())
@@ -169,18 +176,16 @@ DASHBOARD_HTML = """
                         resetUI();
                         showError(data.error);
                     } else {
-                        // Cập nhật thanh xanh lá cây
                         document.getElementById('progressBar').style.width = data.progress + '%';
                         document.getElementById('progressText').innerText = data.status + ' (' + data.progress + '%)';
                         
-                        // Nếu báo 100% (done = true) thì cho nhảy link tải ZIP
                         if(data.done) {
                             clearInterval(pollInterval);
                             document.getElementById('progressText').innerText = '✅ HOÀN TẤT! ĐANG LƯU FILE...';
                             document.getElementById('progressBar').style.backgroundColor = '#3b82f6';
                             setTimeout(() => {
                                 window.location.href = '/api/download_zip/' + taskId;
-                                setTimeout(resetUI, 2000); // 2 giây sau reset lại UI cho tải cái khác
+                                setTimeout(resetUI, 2000); 
                             }, 500);
                         }
                     }
@@ -196,7 +201,7 @@ DASHBOARD_HTML = """
         }
 
         function resetUI() {
-            document.getElementById('downloadBtn').innerHTML = '⚡ BẮT ĐẦU TẢI DỰ ÁN';
+            document.getElementById('downloadBtn').innerHTML = '⚡ BẮT ĐẦU TẢI VỀ MÁY';
             document.getElementById('downloadBtn').style.backgroundColor = '#8b5cf6';
             document.getElementById('downloadBtn').style.pointerEvents = 'auto';
             document.getElementById('progressContainer').style.display = 'none';
@@ -230,7 +235,9 @@ def login():
         if verify_res.status_code != 200 or not (v_data.get("valid") or v_data.get("status") == "ok"):
             return render_template_string(LOGIN_HTML, error=f"❌ {v_data.get('message', 'Key sai, hết hạn hoặc sai IP!')}", last_key=user_key, client_ip=client_ip)
         
+        # Nhét Key và Tên khách hàng vào Session
         session['user_key'] = user_key
+        session['user_name'] = v_data.get("user_name", "VIP Tương Lai")
         return redirect(url_for('dashboard'))
     except Exception as e:
         return render_template_string(LOGIN_HTML, error=f"⚠️ Lỗi kết nối Máy chủ Key: {str(e)}", last_key=user_key, client_ip=client_ip)
@@ -238,15 +245,18 @@ def login():
 @app.route('/dashboard')
 def dashboard():
     if 'user_key' not in session: return redirect(url_for('index'))
-    return render_template_string(DASHBOARD_HTML)
+    # Lấy tên ra hiển thị
+    current_user = session.get('user_name', 'VIP')
+    return render_template_string(DASHBOARD_HTML, user_name=current_user)
 
 @app.route('/logout')
 def logout():
     session.pop('user_key', None)
+    session.pop('user_name', None)
     return redirect(url_for('index'))
 
 # =========================================================================
-# LÕI ĐỘNG CƠ: TẢI NGẦM TRONG BACKGROUND (THREADING)
+# LÕI ĐỘNG CƠ TẢI NGẦM TRONG BACKGROUND
 # =========================================================================
 def background_download_task(task_id, target_uuid, user_key):
     try:
@@ -284,7 +294,6 @@ def background_download_task(task_id, target_uuid, user_key):
                 original_name = photo.get('name') or photo.get('original_name') or f"AutoHDR_Photo_{i+1}.jpg"
                 original_name = unquote(original_name)
                 
-                # Báo ra ngoài Web là đang tải ảnh nào
                 TASKS[task_id]['status'] = f'Đang kéo ảnh {i+1}/{total_photos}...'
                 
                 img_res = requests.get(img_url, timeout=30)
@@ -292,14 +301,12 @@ def background_download_task(task_id, target_uuid, user_key):
                     zf.writestr(original_name, img_res.content)
                     success_count += 1
                 
-                # Tính % tiến trình (Từ 10% đến 95%)
                 current_percent = 10 + int(85 * ((i + 1) / total_photos))
                 TASKS[task_id]['progress'] = current_percent
 
         TASKS[task_id]['status'] = 'Đang đóng gói file ZIP...'
         TASKS[task_id]['progress'] = 98
 
-        # Trừ lượt tải nếu cần
         if success_count > 0:
             try: requests.post(f"{ADMIN_SERVER_URL}/api/consume", json={"key": user_key, "img_count": success_count, "count": success_count}, timeout=5)
             except: pass 
@@ -325,11 +332,9 @@ def api_start():
     if not match: return jsonify({'error': '❌ Mã UUID không hợp lệ!'})
     target_uuid = match.group(1)
 
-    # Sinh ra 1 cái mã riêng cho phiên tải này
     task_id = str(uuid.uuid4())
     TASKS[task_id] = {'progress': 0, 'status': 'Khởi tạo...', 'done': False, 'error': None}
 
-    # Bắn nó vào 1 luồng ngầm (Background Thread) để Server trả lời Browser ngay lập tức
     thread = threading.Thread(target=background_download_task, args=(task_id, target_uuid, session['user_key']))
     thread.daemon = True
     thread.start()
