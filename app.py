@@ -57,7 +57,7 @@ LOGIN_HTML = """
 """
 
 # =========================================================================
-# GIAO DIỆN 2: MÀN HÌNH TẢI ẢNH (ĐÃ THÊM NÚT UPLOAD VÀ HIỆN TÊN USER)
+# GIAO DIỆN 2: MÀN HÌNH TẢI ẢNH
 # =========================================================================
 DASHBOARD_HTML = """
 <!DOCTYPE html>
@@ -81,7 +81,6 @@ DASHBOARD_HTML = """
         h1 { color: #38bdf8; font-size: 28px; font-weight: 900; margin: 0 0 5px 0; }
         .subtitle { color: #94a3b8; font-size: 14px; margin-bottom: 25px; }
         
-        /* Nút Upload Sang Trang Chủ */
         .upload-btn { display: block; width: 100%; padding: 15px; font-size: 15px; font-weight: bold; color: #10b981; border: 2px dashed #10b981; border-radius: 12px; text-decoration: none; margin-bottom: 25px; transition: 0.3s; box-sizing: border-box;}
         .upload-btn:hover { background-color: rgba(16, 185, 129, 0.1); color: #34d399; border-color: #34d399;}
 
@@ -235,7 +234,6 @@ def login():
         if verify_res.status_code != 200 or not (v_data.get("valid") or v_data.get("status") == "ok"):
             return render_template_string(LOGIN_HTML, error=f"❌ {v_data.get('message', 'Key sai, hết hạn hoặc sai IP!')}", last_key=user_key, client_ip=client_ip)
         
-        # Nhét Key và Tên khách hàng vào Session
         session['user_key'] = user_key
         session['user_name'] = v_data.get("user_name", "VIP Tương Lai")
         return redirect(url_for('dashboard'))
@@ -245,7 +243,6 @@ def login():
 @app.route('/dashboard')
 def dashboard():
     if 'user_key' not in session: return redirect(url_for('index'))
-    # Lấy tên ra hiển thị
     current_user = session.get('user_name', 'VIP')
     return render_template_string(DASHBOARD_HTML, user_name=current_user)
 
@@ -256,7 +253,7 @@ def logout():
     return redirect(url_for('index'))
 
 # =========================================================================
-# LÕI ĐỘNG CƠ TẢI NGẦM TRONG BACKGROUND
+# LÕI ĐỘNG CƠ TẢI NGẦM TRONG BACKGROUND (ĐÃ FIX LỖI TÊN FILE GỐC)
 # =========================================================================
 def background_download_task(task_id, target_uuid, user_key):
     try:
@@ -291,8 +288,17 @@ def background_download_task(task_id, target_uuid, user_key):
                 img_url = photo.get('url')
                 if not img_url: continue
                 
-                original_name = photo.get('name') or photo.get('original_name') or f"AutoHDR_Photo_{i+1}.jpg"
+                # --- ĐẠI CA NHÌN ĐOẠN NÀY ĐÂY: VÉT SẠCH TÊN BẰNG MỌI CÁCH ---
+                original_name = photo.get('name') or photo.get('original_name') or photo.get('filename')
+                if not original_name:
+                    # Rạch đường dẫn URL ra lấy tên nếu API chơi dơ giấu tên
+                    original_name = img_url.split('/')[-1].split('?')[0]
+                
+                if not original_name or original_name == "":
+                    original_name = f"AutoHDR_Photo_{i+1}.jpg"
+                
                 original_name = unquote(original_name)
+                # ------------------------------------------------------------
                 
                 TASKS[task_id]['status'] = f'Đang kéo ảnh {i+1}/{total_photos}...'
                 
